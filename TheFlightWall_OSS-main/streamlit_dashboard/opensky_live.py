@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -86,6 +87,41 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
 
+_CALLSIGN_FLIGHT_CORE_RE = re.compile(r"^([A-Z]{2,3}\d+)")
+
+
+def _callsign_flight_core(cs: str) -> str | None:
+    """Strip schedule suffix letters so ``VS47`` matches ``VS47GH``, ``VIR47GH``, etc."""
+    n = _normalize_cs(cs)
+    m = _CALLSIGN_FLIGHT_CORE_RE.match(n)
+    return m.group(1) if m else None
+
+
+def _flight_core_variants(core: str | None) -> set[str]:
+    """Both IATA and ICAO marketing cores (e.g. ``VS47`` + ``VIR47``)."""
+    if not core:
+        return set()
+    out: set[str] = {core}
+    if len(core) >= 3 and core[:2].isalpha() and core[2:].isdigit():
+        iata, digits = core[:2], core[2:]
+        icao = IATA_TO_ICAO.get(iata)
+        if icao:
+            out.add(f"{icao}{digits}")
+    if len(core) >= 4 and core[:3].isalpha() and core[3:].isdigit():
+        icao3, digits = core[:3], core[3:]
+        for iata, icaov in IATA_TO_ICAO.items():
+            if icaov == icao3:
+                out.add(f"{iata}{digits}")
+                break
+    return out
+
+
+def explorer_detail_url(icao24: str) -> str:
+    """OpenSky web UI for one aircraft (hex, lowercase)."""
+    h = _icao24_normalized(icao24)
+    return f"https://opensky-network.org/network/explorer/detail?icao24={h}" if h else "https://opensky-network.org/network/explorer"
+
+
 def _normalize_cs(s: str) -> str:
     return "".join(s.split()).upper()
 
@@ -156,6 +192,9 @@ def _cs_matches(opensky_cs: str | None, candidates: list[str]) -> bool:
     n = _normalize_cs(opensky_cs)
     if not n:
         return False
+    n_core = _callsign_flight_core(n)
+    n_vars = _flight_core_variants(n_core) if n_core else set()
+
     for c in candidates:
         cc = _normalize_cs(c)
         if not cc:
@@ -163,6 +202,10 @@ def _cs_matches(opensky_cs: str | None, candidates: list[str]) -> bool:
         if n.startswith(cc) or cc.startswith(n):
             return True
         if cc in n or n in cc:
+            return True
+        c_core = _callsign_flight_core(cc)
+        c_vars = _flight_core_variants(c_core) if c_core else set()
+        if n_vars and c_vars and (n_vars & c_vars):
             return True
     return False
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+import pandas as pd
 
 try:
     from dotenv import load_dotenv
@@ -362,7 +363,7 @@ def _init_session_defaults() -> None:
 
 
 # Bump when dashboard behavior or defaults change so cache + session quirks reset once per user session.
-_DASHBOARD_BUILD = 12
+_DASHBOARD_BUILD = 13
 
 
 def _compact_flight(s: str) -> str:
@@ -451,6 +452,10 @@ def _cached_opensky_bundle(
 ) -> dict[str, Any]:
     """Cached OpenSky / ADSBDB live bundle (no API key)."""
     fn = str(flight_number).strip()
+    ic = "".join(c for c in str(icao24_hint or "").strip().lower() if c in "0123456789abcdef")
+    ic6 = ic[:6] if len(ic) >= 6 else ""
+    if not fn and ic6:
+        fn = f"ICAO24-{ic6}"
     if not fn:
         return {
             "source": "opensky",
@@ -472,6 +477,13 @@ def _cached_opensky_bundle(
     )
 
 
+def _manual_icao24_sidebar() -> str:
+    """Optional 6-character hex from sidebar (e.g. opensky explorer ``407f19``)."""
+    raw = str(st.session_state.get("inp_icao24", "")).strip().lower()
+    hx = "".join(c for c in raw if c in "0123456789abcdef")
+    return hx[:6] if len(hx) >= 6 else ""
+
+
 def _bundle_for_dashboard(
     *,
     n_roster: int,
@@ -487,7 +499,7 @@ def _bundle_for_dashboard(
             return ""
         return str(leg.icao24 or "").strip()
 
-    ic = _roster_icao24_for_opensky()
+    ic = _manual_icao24_sidebar() or _roster_icao24_for_opensky()
 
     if sb:
         ro, rd = _roster_route_hints_for_lookup(sb, leg)
@@ -505,7 +517,7 @@ def _bundle_for_dashboard(
             "position": None,
         }
     fn = str(st.session_state.inp_flight).strip()
-    return _cached_opensky_bundle(fn, (), "", "", lookup_d, "")
+    return _cached_opensky_bundle(fn, (), "", "", lookup_d, ic)
 
 
 def _opensky_err_user_message(code: str | None) -> str:
@@ -525,7 +537,8 @@ def _opensky_err_user_message(code: str | None) -> str:
     if c == "not_in_airspace":
         return (
             "No live ADS-B match for that ident right now — the aircraft may be on the ground, outside coverage, "
-            "or broadcasting a different callsign. Try **VIR…** / **UAL…** style, or add a **icao24** on the roster row."
+            "or broadcasting a different callsign. Try **VS47** / **VIR47** (suffixes like **GH** match automatically), "
+            "paste **ICAO24** (6 hex) in the sidebar, or set **icao24** on a roster row."
         )
     if c == "no_upcoming_leg":
         return "No upcoming flights in roster"
@@ -544,9 +557,14 @@ def render_sidebar() -> None:
         st.text_input(
             "Flight number",
             key="inp_flight",
-            help="Callsign or flight id (e.g. VS4, VIR4, UAL182). If you type anything here, "
-            "the main card uses **tracker** mode and **ignores** the roster. "
-            "Clear the box to follow the next imported roster leg again.",
+            help="Marketing or radio id (e.g. **VS47**, **VIR47**). Schedule letter suffixes on OpenSky "
+            "(e.g. **VS47GH**) are matched to **VS47** automatically when possible.",
+        )
+        st.text_input(
+            "ICAO24 (optional, 6 hex)",
+            key="inp_icao24",
+            help="From OpenSky Explorer if callsign search fails (example: **407f19**). Overrides roster hex when both apply.",
+            placeholder="e.g. 407f19",
         )
         roster_db.init_db()
         st.date_input(
@@ -800,6 +818,31 @@ def _render_live_flight_board(board: dict[str, Any], *, embedded: bool = False) 
         st.caption(f'Arr {escape(str(b.get("gate_destination") or "—"))}')
 
 
+def _render_opensky_map(
+    pos: opensky_live.AircraftPosition,
+    route_adb: opensky_live.FlightRoute | None,
+) -> None:
+    """Streamlit map: aircraft position plus filed route endpoints when known."""
+    st.markdown("##### Map (OpenSky)")
+    rows: list[dict[str, Any]] = [{"lat": float(pos.lat), "lon": float(pos.lon)}]
+    cap_parts = ["**Aircraft** (live ADS-B)"]
+    if route_adb is not None:
+        rows.append({"lat": float(route_adb.origin_lat), "lon": float(route_adb.origin_lon)})
+        rows.append({"lat": float(route_adb.dest_lat), "lon": float(route_adb.dest_lon)})
+        cap_parts.append("**Origin** / **destination** from ADSBDB route (approx.)")
+    st.caption(" · ".join(cap_parts) + ".")
+    df = pd.DataFrame(rows)
+    try:
+        st.map(df, zoom=4)
+    except TypeError:
+        st.map(df)
+    st.link_button(
+        "Open on OpenSky Explorer (this ICAO24)",
+        opensky_live.explorer_detail_url(pos.icao24),
+        use_container_width=True,
+    )
+
+
 @st.fragment(run_every=timedelta(seconds=_LIVE_CACHE_TTL))
 def live_next_flight_fragment() -> None:
     roster_db.init_db()
@@ -932,6 +975,8 @@ def live_next_flight_fragment() -> None:
     st.progress(pct)
     if row and board and not show_vs_tail:
         _render_live_flight_board(board)
+    if pos_os is not None and board:
+        _render_opensky_map(pos_os, route_adb)
 
 
 def _route_line_from_bundle(bundle: dict[str, Any], n: int, leg: roster_db.RosterLeg | None) -> str:
