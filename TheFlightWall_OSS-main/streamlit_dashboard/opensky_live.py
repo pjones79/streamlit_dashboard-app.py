@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -14,6 +15,16 @@ from urllib.parse import quote
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 OPENSKY_FLIGHTS_AIRCRAFT = "https://opensky-network.org/api/flights/aircraft"
 ADSBDB_CALLSIGN_URL = "https://api.adsbdb.com/v0/callsign/"
+
+# Smaller geographic pulls first — ``/states/all`` (worldwide) is huge and often times out on PaaS.
+# Each tuple is (lamin, lamax, lomin, lomax) per OpenSky docs.
+_OPENSKY_BBOX_ATTEMPTS: list[tuple[float, float, float, float]] = [
+    (36.0, 72.0, -100.0, 42.0),    # North America + North Atlantic + Europe (most transatlantic)
+    (8.0, 45.0, -168.0, -35.0),   # Americas / Caribbean / Central America
+    (-38.0, 38.0, -25.0, 72.0),   # South Atlantic / Africa / Middle East / India (western)
+    (-38.0, 38.0, 72.0, 160.0),   # South Asia / East Asia / western Pacific
+    (-48.0, 8.0, 95.0, 180.0),    # Australia / NZ / East Indies
+]
 
 # Light IATA → ICAO map for common US/international carriers (extend as needed).
 IATA_TO_ICAO: dict[str, str] = {
@@ -221,8 +232,31 @@ def _cs_matches(opensky_cs: str | None, candidates: list[str]) -> bool:
     return False
 
 
+def _opensky_auth() -> tuple[str, str] | None:
+    """Optional OpenSky account — env vars or Streamlit Cloud ``secrets.toml``."""
+    u = os.getenv("OPENSKY_USERNAME", "").strip()
+    p = os.getenv("OPENSKY_PASSWORD", "").strip()
+    if not u or not p:
+        try:
+            import streamlit as st
+
+            sec = getattr(st, "secrets", None)
+            if sec is not None and "OPENSKY_USERNAME" in sec and "OPENSKY_PASSWORD" in sec:
+                u = u or str(sec["OPENSKY_USERNAME"]).strip()
+                p = p or str(sec["OPENSKY_PASSWORD"]).strip()
+        except Exception:
+            pass
+    if u and p:
+        return (u, p)
+    return None
+
+
 def fetch_states(ttl_seconds: float = 25.0) -> list | None:
     """Return OpenSky state vectors (raw arrays); cached to reduce rate limit pressure.
+
+    Uses several **bounding-box** requests first (smaller than worldwide ``/states/all``),
+    which usually succeeds on slow hosts (e.g. Streamlit Cloud). Optional
+    ``OPENSKY_USERNAME`` / ``OPENSKY_PASSWORD`` improve rate limits.
 
     Returns ``None`` only when every fetch attempt fails and there is no prior cache
     (distinct from ``[]``, which means "feed responded but no state rows").
@@ -237,12 +271,61 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
         "Accept": "application/json",
         "Accept-Encoding": "gzip, deflate",
     }
-    for attempt in range(3):
+    auth = _opensky_auth()
+
+    merged: dict[str, list[Any]] = {}
+
+    def _ingest_states_payload(payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        states = payload.get("states")
+        if not isinstance(states, list):
+            return
+        for row in states:
+            if not row or len(row) < 11:
+                continue
+            k = str(row[0] or "").strip().lower()
+            if k:
+                merged[k] = row
+
+    for lamin, lamax, lomin, lomax in _OPENSKY_BBOX_ATTEMPTS:
         try:
             r = _opensky_http().get(
                 OPENSKY_STATES_URL,
-                timeout=(12, 90),
+                params={
+                    "lamin": lamin,
+                    "lamax": lamax,
+                    "lomin": lomin,
+                    "lomax": lomax,
+                },
+                timeout=(10, 55),
                 headers=headers,
+                auth=auth,
+            )
+            if r.status_code == 429:
+                time.sleep(2.0)
+            elif r.status_code >= 500:
+                time.sleep(0.35)
+            else:
+                r.raise_for_status()
+                _ingest_states_payload(r.json())
+        except (requests.RequestException, ValueError):
+            pass
+        time.sleep(0.1)
+
+    if merged:
+        _cache_states = list(merged.values())
+        _cache_at = time.monotonic()
+        return _cache_states
+
+    # Worldwide fallback — large JSON; may time out on shared infrastructure.
+    for attempt in range(2):
+        try:
+            r = _opensky_http().get(
+                OPENSKY_STATES_URL,
+                timeout=(15, 120),
+                headers=headers,
+                auth=auth,
             )
             if r.status_code == 429:
                 time.sleep(min(8.0, 1.5 * (2**attempt)))
@@ -288,6 +371,7 @@ def fetch_aircraft_flights(icao24: str, begin: int, end: int) -> list[dict[str, 
                 "User-Agent": "TheFlightWall-OSS/1.0 (opensky live; +https://github.com/)",
                 "Accept": "application/json",
             },
+            auth=_opensky_auth(),
         )
         if r.status_code != 200:
             return []

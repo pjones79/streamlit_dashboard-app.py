@@ -363,7 +363,7 @@ def _init_session_defaults() -> None:
 
 
 # Bump when dashboard behavior or defaults change so cache + session quirks reset once per user session.
-_DASHBOARD_BUILD = 14
+_DASHBOARD_BUILD = 15
 
 
 def _compact_flight(s: str) -> str:
@@ -531,9 +531,10 @@ def _opensky_err_user_message(code: str | None) -> str:
         )
     if c == "opensky_feed_unavailable":
         return (
-            "Could not load the OpenSky aircraft feed (network, timeout, or rate limit). "
-            "**Streamlit Cloud** and other shared hosts sometimes hit OpenSky limits — try **Refresh live data**, "
-            "or run the app locally. Also try **Refresh** again after a minute."
+            "Could not load OpenSky traffic data from this host (timeout, block, or rate limit). "
+            "The app already tries **smaller regional** downloads first for Cloud. "
+            "Add a free **OpenSky** login via secrets ``OPENSKY_USERNAME`` / ``OPENSKY_PASSWORD`` (see repo `.env.example`), "
+            "then **Refresh live data**. Or run the dashboard locally."
         )
     if c == "not_in_airspace":
         return (
@@ -552,7 +553,7 @@ def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("### Flight tracker")
         st.caption(
-            "Live ADS-B via **OpenSky Network** (+ **ADSBDB** route hints). "
+            "Live ADS-B via **OpenSky** (regional refresh + optional account — see `.env.example`). "
             "Cached about **20s**; use **Refresh live data** to force a new pull."
         )
         st.text_input(
