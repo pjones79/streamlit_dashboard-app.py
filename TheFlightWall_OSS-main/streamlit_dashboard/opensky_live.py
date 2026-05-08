@@ -94,6 +94,18 @@ _opensky_access_token: str | None = None
 _opensky_access_deadline: float = 0.0
 _OPENSKY_TOKEN_MARGIN_S = 45.0
 
+# Last connection diagnostics (for Streamlit "why no data?" UI — no secrets recorded).
+_opensky_oauth_diag: dict[str, Any] = {"configured": False, "token_ok": False, "last_error": None}
+_OPENSKY_FETCH_DIAG: dict[str, Any] = {}
+
+
+def invalidate_live_caches() -> None:
+    """Drop in-memory OpenSky state cache (call when user forces refresh)."""
+    global _cache_states, _cache_at
+    _cache_states = None
+    _cache_at = 0.0
+    _lookup_pos_cache.clear()
+
 
 def _opensky_http() -> requests.Session:
     """Shared Session; ``trust_env=False`` avoids broken HTTP(S)_PROXY on PaaS hosts."""
@@ -265,12 +277,17 @@ def _opensky_client_credentials() -> tuple[str, str] | None:
 
 def _opensky_bearer_token() -> str | None:
     """Client-credentials access token; OpenSky API requires ``Authorization: Bearer`` (Basic auth retired)."""
-    global _opensky_access_token, _opensky_access_deadline
+    global _opensky_access_token, _opensky_access_deadline, _opensky_oauth_diag
     creds = _opensky_client_credentials()
+    _opensky_oauth_diag["configured"] = bool(creds)
     if not creds:
+        _opensky_oauth_diag["token_ok"] = False
+        _opensky_oauth_diag["last_error"] = None
         return None
     now = time.monotonic()
     if _opensky_access_token and now < _opensky_access_deadline:
+        _opensky_oauth_diag["token_ok"] = True
+        _opensky_oauth_diag["last_error"] = None
         return _opensky_access_token
     cid, csec = creds
     try:
@@ -282,20 +299,38 @@ def _opensky_bearer_token() -> str | None:
                 "client_secret": csec,
             },
             timeout=(10, 35),
-            headers={"Accept": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
         )
         r.raise_for_status()
         payload = r.json()
         token = str(payload.get("access_token", "")).strip()
         if not token:
             _opensky_invalidate_token()
+            _opensky_oauth_diag["token_ok"] = False
+            _opensky_oauth_diag["last_error"] = "Token response had no access_token"
             return None
         exp = int(payload.get("expires_in", 1700))
         _opensky_access_token = token
         _opensky_access_deadline = now + max(30.0, float(exp) - _OPENSKY_TOKEN_MARGIN_S)
+        _opensky_oauth_diag["token_ok"] = True
+        _opensky_oauth_diag["last_error"] = None
         return token
-    except (requests.RequestException, ValueError, TypeError):
+    except requests.HTTPError as e:
         _opensky_invalidate_token()
+        body = ""
+        if e.response is not None:
+            body = (e.response.text or "").replace("\n", " ")[:280]
+        code = e.response.status_code if e.response is not None else "?"
+        _opensky_oauth_diag["token_ok"] = False
+        _opensky_oauth_diag["last_error"] = f"HTTP {code} {body}".strip()[:350]
+        return None
+    except (requests.RequestException, ValueError, TypeError) as e:
+        _opensky_invalidate_token()
+        _opensky_oauth_diag["token_ok"] = False
+        _opensky_oauth_diag["last_error"] = str(e)[:350]
         return None
 
 
@@ -328,6 +363,40 @@ def _opensky_api_get(
     return last  # type: ignore[return-value]
 
 
+def opensky_fetch_diagnostics() -> dict[str, Any]:
+    """Snapshot of the last OpenSky pull (safe to show in the UI — no secrets)."""
+    if not _OPENSKY_FETCH_DIAG:
+        out: dict[str, Any] = {
+            "note": "No fetch yet — enter a flight number (or ICAO24) and wait, or click Refresh live data.",
+        }
+    else:
+        out = dict(_OPENSKY_FETCH_DIAG)
+    out["oauth"] = dict(_opensky_oauth_diag)
+    return out
+
+
+def _record_opensky_fetch_diag(
+    *,
+    cache_hit: bool,
+    source: str,
+    aircraft_count: int | None,
+    bbox_notes: list[str],
+    worldwide_note: str | None,
+) -> None:
+    global _OPENSKY_FETCH_DIAG
+    _opensky_bearer_token()  # refresh oauth_diag if a token refresh is due
+    _OPENSKY_FETCH_DIAG = {
+        "cache_hit": cache_hit,
+        "source": source,
+        "aircraft_count": aircraft_count,
+        "bbox_attempts": list(bbox_notes),
+        "worldwide_note": worldwide_note,
+        "oauth_configured": bool(_opensky_oauth_diag.get("configured")),
+        "oauth_token_ok": _opensky_oauth_diag.get("token_ok"),
+        "oauth_last_error": _opensky_oauth_diag.get("last_error"),
+    }
+
+
 def fetch_states(ttl_seconds: float = 25.0) -> list | None:
     """Return OpenSky state vectors (raw arrays); cached to reduce rate limit pressure.
 
@@ -343,9 +412,18 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
     global _cache_states, _cache_at
     now = time.monotonic()
     if _cache_states is not None and (now - _cache_at) < ttl_seconds:
+        _record_opensky_fetch_diag(
+            cache_hit=True,
+            source="memory_ttl",
+            aircraft_count=len(_cache_states),
+            bbox_notes=[],
+            worldwide_note=None,
+        )
         return _cache_states
 
     merged: dict[str, list[Any]] = {}
+    bbox_notes: list[str] = []
+    worldwide_note: str | None = None
 
     def _ingest_states_payload(payload: object) -> None:
         if not isinstance(payload, dict):
@@ -361,6 +439,7 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
                 merged[k] = row
 
     for lamin, lamax, lomin, lomax in _OPENSKY_BBOX_ATTEMPTS:
+        label = f"lamin={lamin}…{lamax} lon={lomin}…{lomax}"
         try:
             r = _opensky_api_get(
                 OPENSKY_STATES_URL,
@@ -373,19 +452,33 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
                 timeout=(10, 55),
             )
             if r.status_code == 429:
+                bbox_notes.append(f"{label}: HTTP 429 (rate limit)")
                 time.sleep(2.0)
             elif r.status_code >= 500:
+                bbox_notes.append(f"{label}: HTTP {r.status_code}")
                 time.sleep(0.35)
             else:
                 r.raise_for_status()
+                before = len(merged)
                 _ingest_states_payload(r.json())
-        except (requests.RequestException, ValueError):
-            pass
+                bbox_notes.append(f"{label}: HTTP {r.status_code}, merged={len(merged)} (+{len(merged) - before})")
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            bbox_notes.append(f"{label}: HTTP {code} (rejected)")
+        except (requests.RequestException, ValueError) as e:
+            bbox_notes.append(f"{label}: {type(e).__name__}")
         time.sleep(0.1)
 
     if merged:
         _cache_states = list(merged.values())
         _cache_at = time.monotonic()
+        _record_opensky_fetch_diag(
+            cache_hit=False,
+            source="bbox_merge",
+            aircraft_count=len(_cache_states),
+            bbox_notes=bbox_notes,
+            worldwide_note=None,
+        )
         return _cache_states
 
     # Worldwide fallback — large JSON; may time out on shared infrastructure.
@@ -397,14 +490,22 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
                 timeout=(15, 120),
             )
             if r.status_code == 429:
+                worldwide_note = f"worldwide try {attempt + 1}: HTTP 429"
                 time.sleep(min(8.0, 1.5 * (2**attempt)))
                 continue
             if r.status_code >= 500:
+                worldwide_note = f"worldwide try {attempt + 1}: HTTP {r.status_code}"
                 time.sleep(0.4 * (attempt + 1))
                 continue
             r.raise_for_status()
             payload = r.json()
-        except (requests.RequestException, ValueError):
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            worldwide_note = f"worldwide try {attempt + 1}: HTTP {code}"
+            time.sleep(0.35 * (attempt + 1))
+            continue
+        except (requests.RequestException, ValueError) as e:
+            worldwide_note = f"worldwide try {attempt + 1}: {type(e).__name__}: {e}"
             time.sleep(0.35 * (attempt + 1))
             continue
 
@@ -412,12 +513,33 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
         if not states:
             _cache_states = _cache_states or []
             _cache_at = time.monotonic()
+            _record_opensky_fetch_diag(
+                cache_hit=False,
+                source="worldwide_empty",
+                aircraft_count=0,
+                bbox_notes=bbox_notes,
+                worldwide_note=worldwide_note,
+            )
             return _cache_states
 
         _cache_states = states
         _cache_at = time.monotonic()
+        _record_opensky_fetch_diag(
+            cache_hit=False,
+            source="worldwide",
+            aircraft_count=len(states),
+            bbox_notes=bbox_notes,
+            worldwide_note=f"worldwide OK (try {attempt + 1})",
+        )
         return _cache_states
 
+    _record_opensky_fetch_diag(
+        cache_hit=False,
+        source="failed",
+        aircraft_count=None,
+        bbox_notes=bbox_notes,
+        worldwide_note=worldwide_note,
+    )
     return _cache_states
 
 
@@ -784,6 +906,14 @@ def build_dashboard_bundle(
         return {
             "source": "opensky",
             "err": "opensky_feed_unavailable",
+            "flight": None,
+            "board": None,
+            "position": None,
+        }
+    if len(states) == 0:
+        return {
+            "source": "opensky",
+            "err": "opensky_feed_empty",
             "flight": None,
             "board": None,
             "position": None,

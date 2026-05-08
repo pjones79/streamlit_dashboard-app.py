@@ -363,7 +363,7 @@ def _init_session_defaults() -> None:
 
 
 # Bump when dashboard behavior or defaults change so cache + session quirks reset once per user session.
-_DASHBOARD_BUILD = 16
+_DASHBOARD_BUILD = 17
 
 
 def _compact_flight(s: str) -> str:
@@ -389,6 +389,7 @@ def _apply_dashboard_migrations() -> None:
     """Clear stale live-data cache after upgrades; drop legacy default flight number."""
     if st.session_state.get("_dashboard_build") != _DASHBOARD_BUILD:
         _cached_opensky_bundle.clear()
+        opensky_live.invalidate_live_caches()
         st.session_state["_dashboard_build"] = _DASHBOARD_BUILD
         st.session_state.pop("inp_dep_t", None)
         st.session_state.pop("inp_fa_date_str", None)
@@ -537,6 +538,12 @@ def _opensky_err_user_message(code: str | None) -> str:
             "(OAuth client from opensky-network.org; see `.env.example`), "
             "then **Refresh live data**. Or run the dashboard locally."
         )
+    if c == "opensky_feed_empty":
+        return (
+            "OpenSky responded but returned **no aircraft** in the live feed (unusual). "
+            "Open **OpenSky connection** below — if OAuth shows an error, fix secrets; if you see only HTTP 429, "
+            "you are rate-limited (credentials usually fix that on Cloud). Then **Refresh live data**."
+        )
     if c == "not_in_airspace":
         return (
             "No live ADS-B match for that ident right now — the aircraft may be on the ground, outside coverage, "
@@ -592,8 +599,16 @@ def render_sidebar() -> None:
             key="fa_force_refresh",
         ):
             _cached_opensky_bundle.clear()
+            opensky_live.invalidate_live_caches()
             st.toast("Live data cache cleared — fetching fresh data.", icon="🔄")
             st.rerun()
+
+        with st.expander("OpenSky connection (troubleshooting)"):
+            st.caption(
+                "After a flight lookup or refresh, this shows whether OAuth worked and how many aircraft "
+                "were loaded. Scan **bbox_attempts** if every regional request failed."
+            )
+            st.json(opensky_live.opensky_fetch_diagnostics())
 
         st.markdown("---")
         st.markdown("### My Roster")
@@ -869,14 +884,14 @@ def live_next_flight_fragment() -> None:
     icao_q = _manual_icao24_sidebar()
     has_tracker_intent = bool(sb) or bool(icao_q) or (n_roster and leg is not None)
 
-    if err in ("no_flight", "opensky_feed_unavailable") and not has_tracker_intent:
-        if err == "opensky_feed_unavailable":
+    if err in ("no_flight", "opensky_feed_unavailable", "opensky_feed_empty") and not has_tracker_intent:
+        if err in ("opensky_feed_unavailable", "opensky_feed_empty"):
             st.warning(_opensky_err_user_message(err))
         else:
             st.caption("Use the **sidebar** to enter a flight or **ICAO24**, or import a **roster CSV**.")
         return
 
-    if err == "opensky_feed_unavailable":
+    if err in ("opensky_feed_unavailable", "opensky_feed_empty"):
         _render_identity_line(user_raw, row)
         st.error(_opensky_err_user_message(err))
         return
