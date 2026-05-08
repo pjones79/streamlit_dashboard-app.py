@@ -559,6 +559,7 @@ def build_dashboard_bundle(
         icao24=icao24_hint,
         states=states,
     )
+    if pos is None:
         return {
             "source": "opensky",
             "err": "not_in_airspace",
