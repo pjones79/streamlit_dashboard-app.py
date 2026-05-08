@@ -129,25 +129,24 @@ def fetch_route_adsbdb(callsign: str) -> FlightRoute | None:
 
 
 def callsign_candidates(flight_number: str, explicit_callsign: str | None) -> list[str]:
-    """Build likely ADS-B callsign prefixes from a marketing flight number."""
-    if explicit_callsign:
-        c = _normalize_cs(explicit_callsign)
-        return list(dict.fromkeys([c])) if c else []
-
+    """Build likely ADS-B callsign prefixes from a marketing flight number plus optional roster hint."""
     raw = str(flight_number).strip()
     compact = _normalize_cs(raw)
     out: list[str] = []
     if compact:
         out.append(compact)
-    # Short IATA+flight e.g. "VS3" / "BA1" → ICAO + digits (IATA is 2 letters, flight is numeric)
     if len(compact) >= 3 and compact[:2].isalpha() and compact[2:].isdigit():
         iata, digits = compact[:2], compact[2:]
         icao = IATA_TO_ICAO.get(iata)
         if icao:
             out.append(f"{icao}{digits}")
-    # ICAO-style "UAL182", "VIR3" (3-letter airline designator + digits)
     if len(compact) >= 4 and compact[:3].isalpha() and compact[3:].isdigit():
         out.append(compact)
+
+    ex = _normalize_cs(str(explicit_callsign or "").strip())
+    if ex:
+        out.insert(0, ex)
+
     return list(dict.fromkeys([x for x in out if x]))
 
 
@@ -175,8 +174,11 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
     if _cache_states is not None and (now - _cache_at) < ttl_seconds:
         return _cache_states
 
+    _ua = {
+        "User-Agent": "TheFlightWall-OSS/1.0 (opensky live; +https://github.com/)",
+    }
     try:
-        r = requests.get(OPENSKY_STATES_URL, timeout=35)
+        r = requests.get(OPENSKY_STATES_URL, timeout=35, headers=_ua)
         r.raise_for_status()
         payload = r.json()
     except (requests.RequestException, ValueError):
@@ -208,6 +210,9 @@ def fetch_aircraft_flights(icao24: str, begin: int, end: int) -> list[dict[str, 
             OPENSKY_FLIGHTS_AIRCRAFT,
             params={"icao24": h, "begin": int(begin), "end": int(end)},
             timeout=35,
+            headers={
+                "User-Agent": "TheFlightWall-OSS/1.0 (opensky live; +https://github.com/)",
+            },
         )
         if r.status_code != 200:
             return []
@@ -552,6 +557,15 @@ def build_dashboard_bundle(
         return empty
 
     states = fetch_states(24.0)
+    if states is None:
+        return {
+            "source": "opensky",
+            "err": "opensky_feed_unavailable",
+            "flight": None,
+            "board": None,
+            "position": None,
+        }
+
     pos = lookup_aircraft(
         fn_in,
         explicit_callsign=explicit_callsign,

@@ -508,6 +508,32 @@ def _bundle_for_dashboard(
     return _cached_opensky_bundle(fn, (), "", "", lookup_d, "")
 
 
+def _opensky_err_user_message(code: str | None) -> str:
+    """Plain-language status line for OpenSky bundle error codes."""
+    c = str(code or "").strip()
+    if c == "no_flight":
+        return (
+            "No flight to look up — open the sidebar (**Flight tracker**), enter a callsign or flight number "
+            "(e.g. **VIR4**, **VS4**), or import a roster so the next leg supplies a ident. "
+            "Positions are only shown when OpenSky has a live ADS-B match."
+        )
+    if c == "opensky_feed_unavailable":
+        return (
+            "Could not load the OpenSky aircraft feed from this app session (network, timeout, or rate limit). "
+            "Try **Refresh live data** in the sidebar after a short wait."
+        )
+    if c == "not_in_airspace":
+        return (
+            "No live ADS-B match for that ident right now — the aircraft may be on the ground, outside coverage, "
+            "or broadcasting a different callsign. Try **VIR…** / **UAL…** style, or add a **icao24** on the roster row."
+        )
+    if c == "no_upcoming_leg":
+        return "No upcoming flights in roster"
+    if c:
+        return f"OpenSky: {c}"
+    return "—"
+
+
 def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("### Flight tracker")
@@ -806,13 +832,13 @@ def live_next_flight_fragment() -> None:
 
     if err == "no_upcoming_leg":
         dep_route = arr_route = dep_when = arr_when = "—"
-        pct, status_line = 0.0, "No upcoming flights in roster"
+        pct, status_line = 0.0, _opensky_err_user_message(err)
         flight_no = "—"
         eyebrow = "Next flight (roster)"
     elif err:
         flight_subline = ""
         dep_route = arr_route = dep_when = arr_when = "—"
-        pct, status_line = 0.0, f"OpenSky: {err}"
+        pct, status_line = 0.0, _opensky_err_user_message(err)
         eyebrow = "Next flight (roster)" if (leg and not sb) else "Flight tracker"
         journey_html = _journey_block_html(opensky_live.empty_journey_metrics())
         if leg and not sb:
@@ -865,7 +891,11 @@ def live_next_flight_fragment() -> None:
             flight_subline = f"{pre} · {flight_subline}" if flight_subline else pre
     else:
         flight_no = escape(user_raw or "—")
-        pct, status_line = 0.0, "OpenSky: no live board rows"
+        pct, status_line = (
+            0.0,
+            "No live track to display — if you entered a flight, try **Refresh live data**; "
+            "otherwise OpenSky may not have matched this ident yet.",
+        )
 
     card_body = _flight_card_html(
         eyebrow=eyebrow,
