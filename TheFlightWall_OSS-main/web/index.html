@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TheFlightWall — nearby flights</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="header">
+        <h1>Nearby flights</h1>
+        <p class="subtitle">
+          Same OpenSky bounding-box and radius logic as the
+          <a href="https://github.com/TheFlightWall/TheFlightWall_OSS" rel="noreferrer">TheFlightWall</a>
+          firmware (OAuth stays on the server).
+        </p>
+      </header>
+
+      <section class="controls">
+        <label>
+          Center latitude
+          <input id="lat" type="number" step="any" />
+        </label>
+        <label>
+          Center longitude
+          <input id="lon" type="number" step="any" />
+        </label>
+        <label>
+          Radius (km)
+          <input id="radius" type="number" step="0.5" min="1" max="200" />
+        </label>
+        <button id="apply" type="button">Update</button>
+        <button id="geolocate" type="button">Use my location</button>
+        <span id="status" class="status" aria-live="polite"></span>
+      </section>
+
+      <div id="map"></div>
+
+      <section class="table-wrap">
+        <table class="flights" id="flights-table">
+          <thead>
+            <tr>
+              <th>Callsign</th>
+              <th>ICAO24</th>
+              <th>Country</th>
+              <th>Dist (km)</th>
+              <th>Bearing°</th>
+              <th>Alt (m)</th>
+              <th>GS (m/s)</th>
+              <th>Hdg°</th>
+              <th>On ground</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

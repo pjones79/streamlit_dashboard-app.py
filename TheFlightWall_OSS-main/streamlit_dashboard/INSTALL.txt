@@ -1,0 +1,122 @@
+Streamlit on Windows (especially Windows on ARM + Python 3.12)
+===============================================================
+
+PIP FAILED ON "httptools" OR "pyarrow" (you are probably on win_arm64)
+---------------------------------------------------------------------
+That means pip is **compiling** packages because **no wheel exists** for your Python
+build. **Do not fight MSVC / CMake for this** — use **Conda** or **x86-64 Python**.
+
+**Fast fix (recommended): Miniforge + conda-forge** — copy/paste in "Miniforge Prompt":
+
+  conda create -n flightdash python=3.12 -y
+  conda activate flightdash
+  conda install -c conda-forge streamlit pandas requests python-dotenv -y
+
+Then:
+
+  cd ...\TheFlightWall_OSS-main\streamlit_dashboard
+  streamlit run app.py
+
+(Optional) anything missing:  python -m pip install -r requirements-minimal.txt
+
+**Alternative:** Uninstall ARM64 Python, install the **Windows x86-64** installer from
+python.org (same machine; runs under emulation). Then plain
+`python -m pip install -r requirements.txt` usually works.
+
+
+"'conda' is not recognized"
+---------------------------
+You do not have Conda/Miniforge installed yet. Either install it (Option 1 below) or skip
+Conda and use a normal Python install (Option 2).
+
+"'streamlit' is not recognized"
+-------------------------------
+That only works after Streamlit is installed, and only if Python's Scripts folder is on
+PATH. Safer on every machine:
+
+  cd ...\streamlit_dashboard
+  python -m pip install -r requirements.txt
+  python -m streamlit run app.py
+
+Or double-click `run_dashboard.bat` in this folder (it uses `python -m streamlit`).
+
+
+Wrong Python used (ARM64 pip + httptools / pyarrow build errors)
+------------------------------------------------------------------
+If `pip` output mentions **`Python312-arm64`** under `AppData\Local\Programs\Python\...`,
+you are **not** using the `flightdash` interpreter — you are using the standalone ARM64
+Python from python.org / the Store.
+
+**Fix — pick one:**
+
+1) **Use the flightdash executable explicitly** (no `conda activate` needed):
+
+  cd ...\streamlit_dashboard
+  "C:\Users\YOURNAME\miniconda3\envs\flightdash\python.exe" -c "import sys; print(sys.executable)"
+  "C:\Users\YOURNAME\miniconda3\envs\flightdash\python.exe" -m pip install -r requirements-minimal.txt
+
+  (Streamlit + PyArrow should already be in `flightdash` if you installed them with conda.)
+
+2) **Install the map deps with conda** (recommended after `conda activate flightdash`):
+
+  conda install -c conda-forge requests -y
+
+3) **Never mix:** Do not run `python -m pip install -r requirements.txt` until
+   `where python` (cmd) shows `...\miniconda3\envs\flightdash\python.exe`.
+
+If `pip install -r requirements.txt` fails while *building* `pyarrow` or `httptools`,
+you are almost certainly missing pre-built wheels for your Python **platform** (common on
+`win_arm64`). Fixing that is usually easier than installing compilers.
+
+Check your platform
+-------------------
+  python -c "import platform; print(platform.machine(), platform.python_version())"
+
+If you see `ARM64`, use one of the options below.
+
+
+Option 1 — Conda (recommended on ARM64 Windows)
+------------------------------------------------
+Install **Miniforge** (includes conda): https://github.com/conda-forge/miniforge/releases  
+Download the Windows installer for your PC, run it, then open **"Miniforge Prompt"**
+from the Start menu and run:
+
+  conda create -n flightdash python=3.12 -y
+  conda activate flightdash
+  conda install -c conda-forge streamlit -y
+
+Then from this folder:
+
+  cd ...\streamlit_dashboard
+  streamlit run app.py
+
+Conda-forge ships compiled binaries for more CPU targets than pip for some packages.
+
+
+Option 2 — Use 64-bit Intel Python (“AMD64”), not ARM64 Python
+--------------------------------------------------------------
+Even on an ARM PC, the common fix is to install the **Windows x86-64** build of Python
+from https://www.python.org/downloads/windows/ (choose “64-bit”, not “ARM64”).
+
+That Python runs under emulation but **pip wheels are widely available**, so installs
+usually “just work”.
+
+Then:
+
+  python -m pip install -U pip
+  cd ...\streamlit_dashboard
+  python -m pip install -r requirements.txt
+  python -m streamlit run app.py
+
+
+Option 3 — Install compilers (slow; last resort)
+-------------------------------------------------
+Install “Build Tools for Visual Studio” with the **Desktop development with C++** workload,
+plus CMake as needed, then retry pip. PyArrow may take a long time to compile.
+
+
+Always run from the streamlit_dashboard folder
+----------------------------------------------
+  ...\TheFlightWall_OSS-main\streamlit_dashboard
+
+That directory must contain `app.py` and `requirements.txt`.

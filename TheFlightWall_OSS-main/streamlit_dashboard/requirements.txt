@@ -1,0 +1,14 @@
+# Windows ARM64 (win_arm64): pip often tries to BUILD pyarrow + httptools and fails.
+# Use INSTALL.txt — conda-forge first, or x86-64 Python — not MSVC.
+
+streamlit>=1.40.0
+extra-streamlit-components>=0.1.71
+pandas>=2.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+tzdata>=2024.1
+Pillow>=10.0
+
+# If pip compiles pyarrow or httptools, stop and read INSTALL.txt. Prefer:
+#   conda install -c conda-forge streamlit pandas requests python-dotenv -y
+# then (optional):  pip install -r requirements-minimal.txt

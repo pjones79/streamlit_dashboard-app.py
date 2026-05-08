@@ -1,0 +1,9 @@
+misc
+.DS_Store
+.venv
+firmware/.pio
+web/node_modules
+web/dist
+web/.env
+streamlit_dashboard/.env
+streamlit_dashboard/roster.sqlite3

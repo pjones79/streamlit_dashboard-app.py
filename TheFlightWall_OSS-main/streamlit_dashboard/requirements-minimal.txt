@@ -1,0 +1,9 @@
+# Use AFTER installing with Conda (see INSTALL.txt), e.g.
+#   conda create -n flightdash python=3.12 -y
+#   conda activate flightdash
+#   conda install -c conda-forge streamlit pandas requests python-dotenv -y
+#
+# This file only adds anything missing; it avoids pulling Streamlit/PyArrow through pip
+# on Windows ARM64 (which triggers httptools/pyarrow source builds).
+requests>=2.31.0
+python-dotenv>=1.0.0
