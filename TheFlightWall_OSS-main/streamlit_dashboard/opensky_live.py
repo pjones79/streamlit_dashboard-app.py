@@ -1,4 +1,4 @@
-"""OpenSky Network + ADSBDB: live ADS-B positions and lightweight route/history helpers (no FlightAware fees)."""
+"""OpenSky Network + ADSBDB: live ADS-B positions and lightweight route/history helpers."""
 from __future__ import annotations
 
 import math
@@ -477,7 +477,7 @@ def summarize_board_dict(
     flight_rec: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """
-    Flat dict shaped like FlightAware ``summarize_flight_board`` for reuse in ``_render_live_flight_board``.
+    Flat dict for ``_render_live_flight_board`` (ident, lat/lon, altitude, speed, route text).
     """
     o_text = dest_text = "—"
     if route_adb is not None:
@@ -535,7 +535,7 @@ def build_dashboard_bundle(
     search_date: date | None,
 ) -> dict[str, Any]:
     """
-    Full OpenSky-backed bundle for ``_bundle_for_dashboard`` (FlightAware-compatible keys where possible).
+    Full OpenSky-backed bundle for ``_bundle_for_dashboard``.
 
     Combines OpenSky ``states``, optional ``flights/aircraft`` history,
     ADSBDB callsign routing (approximate schedule), roster ICAO hints.
@@ -551,7 +551,6 @@ def build_dashboard_bundle(
     if not fn_in:
         return empty
 
-    want_hex = _icao24_normalized(icao24_hint)
     states = fetch_states(24.0)
     pos = lookup_aircraft(
         fn_in,

@@ -38,7 +38,7 @@ def _pad_digits(digits: str) -> str:
     return digits.zfill(4)
 
 
-def build_flight_identity(user_input: str, fa_row: dict[str, Any] | None) -> dict[str, Any]:
+def build_flight_identity(user_input: str, flight_row: dict[str, Any] | None) -> dict[str, Any]:
     compact = _norm_compact(user_input)
     iata_guess, icao_guess, digits_guess = _split_carrier_digits(compact)
 
@@ -47,13 +47,13 @@ def build_flight_identity(user_input: str, fa_row: dict[str, Any] | None) -> dic
     icao: str | None = None
     digits: str = digits_guess
 
-    if fa_row:
-        airline_name = (fa_row.get("operator") or "").strip() or None
-        iata = ((fa_row.get("operator_iata") or "") or "").strip().upper() or None
-        icao = ((fa_row.get("operator_icao") or "") or "").strip().upper() or None
-        ident_iata = ((fa_row.get("ident_iata") or "") or "").strip().upper()
-        ident_icao = ((fa_row.get("ident_icao") or "") or "").strip().upper()
-        fn = str(fa_row.get("flight_number") or "").strip().upper()
+    if flight_row:
+        airline_name = (flight_row.get("operator") or "").strip() or None
+        iata = ((flight_row.get("operator_iata") or "") or "").strip().upper() or None
+        icao = ((flight_row.get("operator_icao") or "") or "").strip().upper() or None
+        ident_iata = ((flight_row.get("ident_iata") or "") or "").strip().upper()
+        ident_icao = ((flight_row.get("ident_icao") or "") or "").strip().upper()
+        fn = str(flight_row.get("flight_number") or "").strip().upper()
 
         if ident_iata and len(ident_iata) >= 3 and ident_iata[2:].isdigit():
             iata = iata or ident_iata[:2]
@@ -111,9 +111,9 @@ def build_flight_identity(user_input: str, fa_row: dict[str, Any] | None) -> dic
     }
 
 
-def is_virgin_atlantic(user_input: str, fa_row: dict[str, Any] | None) -> bool:
+def is_virgin_atlantic(user_input: str, flight_row: dict[str, Any] | None) -> bool:
     """True when the flight is Virgin Atlantic (VS / VIR)."""
-    info = build_flight_identity(user_input.strip(), fa_row)
+    info = build_flight_identity(user_input.strip(), flight_row)
     iata_p = (info.get("ident_iata_padded") or "").upper()
     icao_p = (info.get("ident_icao_padded") or "").upper()
     if iata_p.startswith("VS") and iata_p != "—":

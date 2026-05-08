@@ -1,12 +1,12 @@
 """
-Dark-mode flight dashboard with FlightAware AeroAPI (flight card + live details).
+Dark-mode flight dashboard: live ADS-B via OpenSky Network (+ ADSBDB route hints).
 Run: streamlit run app.py
 """
 from __future__ import annotations
 
 import hashlib
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -24,18 +24,15 @@ except ImportError:
 
 import importlib
 
-import aeroapi_client
-import cookie_prefs
 import flight_identity
+import geo_places
 import image_utils
 import opensky_live
-import flightaware_links
 import roster_db
 
 # Streamlit reruns this script but keeps already-imported modules in sys.modules; reload so
 # edits to these local modules apply without a full server restart.
-importlib.reload(aeroapi_client)
-importlib.reload(cookie_prefs)
+importlib.reload(geo_places)
 importlib.reload(opensky_live)
 importlib.reload(flight_identity)
 importlib.reload(roster_db)
@@ -352,20 +349,9 @@ def _global_css() -> str:
 """
 
 
-def _parse_iso_dt(val: Any) -> datetime | None:
-    if val is None or not isinstance(val, str) or not val.strip():
-        return None
-    try:
-        return datetime.fromisoformat(val.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
 def _init_session_defaults() -> None:
     if "inp_flight" not in st.session_state:
         st.session_state.inp_flight = ""
-    if "inp_live_source" not in st.session_state:
-        st.session_state.inp_live_source = "flightaware"
     if "inp_fa_date" not in st.session_state:
         d = None
         s = st.session_state.get("inp_fa_date_str")
@@ -373,11 +359,10 @@ def _init_session_defaults() -> None:
             d = roster_db.parse_uk_date(str(s))
         st.session_state.inp_fa_date = d
     st.session_state.pop("inp_fa_date_str", None)
-    cookie_prefs.hydrate_api_key_widget_defaults()
 
 
 # Bump when dashboard behavior or defaults change so cache + session quirks reset once per user session.
-_DASHBOARD_BUILD = 11
+_DASHBOARD_BUILD = 12
 
 
 def _compact_flight(s: str) -> str:
@@ -389,13 +374,8 @@ def _is_removed_demo_flight(s: str) -> bool:
     return c in ("UA1823", "UAL1823")
 
 
-def _effective_aeroapi_key() -> str:
-    """User-supplied key in the sidebar (session) or ``AEROAPI_KEY`` from the environment."""
-    return aeroapi_client.get_api_key(session_override=str(st.session_state.get("user_aeroapi_key", "")))
-
-
 def _fa_lookup_date() -> date:
-    """Calendar day for AeroAPI search. If the sidebar date is empty, use **today**."""
+    """Calendar day for OpenSky segment overlap (UTC day). If the sidebar date is empty, use **today**."""
     v = st.session_state.get("inp_fa_date")
     if isinstance(v, datetime):
         return v.date()
@@ -405,9 +385,8 @@ def _fa_lookup_date() -> date:
 
 
 def _apply_dashboard_migrations() -> None:
-    """Clear stale FlightAware cache after upgrades; drop legacy default flight number."""
+    """Clear stale live-data cache after upgrades; drop legacy default flight number."""
     if st.session_state.get("_dashboard_build") != _DASHBOARD_BUILD:
-        _cached_fa_bundle.clear()
         _cached_opensky_bundle.clear()
         st.session_state["_dashboard_build"] = _DASHBOARD_BUILD
         st.session_state.pop("inp_dep_t", None)
@@ -418,7 +397,7 @@ def _apply_dashboard_migrations() -> None:
         st.session_state.inp_flight = ""
 
 
-_FA_CACHE_TTL = 20
+_LIVE_CACHE_TTL = 20
 
 _MARK_FN_RE = re.compile(r"^([A-Z]{2})(\d{1,4})([A-Z]?)$")
 
@@ -442,8 +421,8 @@ def _norm_flight_id_for_match(s: str) -> str:
 def _roster_route_hints_for_lookup(sb: str, leg: roster_db.RosterLeg | None) -> tuple[str, str]:
     """
     When the sidebar flight matches the next roster leg (or the leg has route-only placeholder),
-    pass origin/destination into FlightAware so ident-date lookups prefer the correct direction
-    (same flight number often has outbound and return in the window).
+    pass origin/destination into lookups so the correct sector is preferred when the same
+    flight number appears on multiple routes.
     """
     if leg is None:
         return "", ""
@@ -461,65 +440,7 @@ def _roster_route_hints_for_lookup(sb: str, leg: roster_db.RosterLeg | None) -> 
     return "", ""
 
 
-@st.cache_data(ttl=_FA_CACHE_TTL, show_spinner=False)
-def _cached_fa_bundle(
-    api_key: str,
-    flight_number: str,
-    day_iso: str,
-    extra_idents: tuple[str, ...],
-    route_o: str,
-    route_d: str,
-) -> dict[str, Any]:
-    """
-    Cached FlightAware snapshot (flight row, position, flattened board fields).
-    Browser refresh can still show the same snapshot until the TTL elapses — click **Refresh FlightAware now** in the sidebar to clear the cache.
-    """
-    key = str(api_key).strip()
-    out: dict[str, Any] = {
-        "source": "flightaware",
-        "err": None,
-        "flight": None,
-        "position": None,
-        "ident_used": None,
-        "board": None,
-    }
-    fn = str(flight_number).strip()
-    if not key:
-        out["err"] = "missing_AEROAPI_KEY"
-        return out
-    if not fn:
-        out["err"] = "no_flight"
-        return out
-    try:
-        d = date.fromisoformat(day_iso)
-    except ValueError:
-        out["err"] = "bad_date"
-        return out
-
-    row, ident, err = aeroapi_client.find_flight_for_lookup(
-        fn,
-        key,
-        on_date=d,
-        extra_idents_first=list(extra_idents) if extra_idents else None,
-        origin_hint=route_o.strip() or None,
-        dest_hint=route_d.strip() or None,
-    )
-    if err or not row:
-        out["err"] = err or "not_found"
-        return out
-
-    out["flight"] = row
-    out["ident_used"] = ident
-    fid = row.get("fa_flight_id")
-    pos = None
-    if fid:
-        pos = aeroapi_client.fetch_position(str(fid), key)
-    out["position"] = pos
-    out["board"] = aeroapi_client.summarize_flight_board(row, pos)
-    return out
-
-
-@st.cache_data(ttl=_FA_CACHE_TTL, show_spinner=False)
+@st.cache_data(ttl=_LIVE_CACHE_TTL, show_spinner=False)
 def _cached_opensky_bundle(
     flight_number: str,
     extra_idents: tuple[str, ...],
@@ -556,7 +477,6 @@ def _bundle_for_dashboard(
     n_roster: int,
     leg: roster_db.RosterLeg | None,
 ) -> dict[str, Any]:
-    src = str(st.session_state.get("inp_live_source", "flightaware"))
     sb = str(st.session_state.get("inp_flight", "")).strip()
     lookup_d = _fa_lookup_date().isoformat()
 
@@ -569,146 +489,64 @@ def _bundle_for_dashboard(
 
     ic = _roster_icao24_for_opensky()
 
-    if src == "opensky":
-        if sb:
-            ro, rd = _roster_route_hints_for_lookup(sb, leg)
-            return _cached_opensky_bundle(sb, (), ro, rd, lookup_d, ic)
-        if n_roster and leg:
-            fa_fn, extra = roster_db.flightaware_ident_from_leg(leg, "")
-            ro, rd = leg.origin.strip(), leg.destination.strip()
-            return _cached_opensky_bundle(fa_fn, extra, ro, rd, lookup_d, ic)
-        if n_roster:
-            return {
-                "source": "opensky",
-                "err": "no_upcoming_leg",
-                "flight": None,
-                "board": None,
-                "position": None,
-            }
-        fn = str(st.session_state.inp_flight).strip()
-        return _cached_opensky_bundle(fn, (), "", "", lookup_d, "")
-
-    ak = _effective_aeroapi_key()
     if sb:
         ro, rd = _roster_route_hints_for_lookup(sb, leg)
-        return _cached_fa_bundle(ak, sb, lookup_d, (), ro, rd)
+        return _cached_opensky_bundle(sb, (), ro, rd, lookup_d, ic)
     if n_roster and leg:
         fa_fn, extra = roster_db.flightaware_ident_from_leg(leg, "")
         ro, rd = leg.origin.strip(), leg.destination.strip()
-        return _cached_fa_bundle(ak, fa_fn, lookup_d, extra, ro, rd)
+        return _cached_opensky_bundle(fa_fn, extra, ro, rd, lookup_d, ic)
     if n_roster:
         return {
-            "source": "flightaware",
+            "source": "opensky",
             "err": "no_upcoming_leg",
             "flight": None,
-            "ident_used": None,
             "board": None,
+            "position": None,
         }
     fn = str(st.session_state.inp_flight).strip()
-    return _cached_fa_bundle(ak, fn, lookup_d, (), "", "")
-
-
-def _progress_from_fa(row: dict[str, Any] | None, board: dict[str, Any] | None) -> tuple[float, str]:
-    if row is None:
-        return 0.0, "—"
-    status = (row.get("status") or "").strip() or "—"
-    pct_raw = row.get("progress_percent")
-    if pct_raw is not None:
-        try:
-            p = max(0.0, min(100.0, float(pct_raw))) / 100.0
-            return p, status
-        except (TypeError, ValueError):
-            pass
-    dep = _parse_iso_dt(aeroapi_client.pick_departure_iso_for_display(row, None))
-    arr = _parse_iso_dt(aeroapi_client.pick_arrival_iso_for_display(row, None))
-    if dep is None or arr is None:
-        return 0.0, status
-    if dep.tzinfo is None:
-        dep = dep.replace(tzinfo=timezone.utc)
-    else:
-        dep = dep.astimezone(timezone.utc)
-    if arr.tzinfo is None:
-        arr = arr.replace(tzinfo=timezone.utc)
-    else:
-        arr = arr.astimezone(timezone.utc)
-    now_utc = datetime.now(timezone.utc)
-    if now_utc < dep:
-        return 0.0, status
-    if now_utc >= arr:
-        return 1.0, status
-    num = (now_utc - dep).total_seconds()
-    den = max((arr - dep).total_seconds(), 1.0)
-    return min(max(num / den, 0.0), 1.0), status
+    return _cached_opensky_bundle(fn, (), "", "", lookup_d, "")
 
 
 def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("### Flight tracker")
-        st.radio(
-            "Live data source",
-            ("flightaware", "opensky"),
-            format_func=lambda v: (
-                "FlightAware AeroAPI (your key)"
-                if v == "flightaware"
-                else "OpenSky Live (free ADS-B)"
-            ),
-            horizontal=True,
-            key="inp_live_source",
-            help="FlightAware: schedules & airline-quality status (needs key). "
-            "OpenSky: worldwide ADS-B positions (coverage gaps; route times are best-effort via OpenSky history + ADSBDB).",
-        )
-        st.text_input(
-            "Your FlightAware AeroAPI key",
-            type="password",
-            key="user_aeroapi_key",
-            help="Your key from flightaware.com/commercial/aeroapi — only used when **FlightAware AeroAPI** is selected above. "
-            "For local runs you can set AEROAPI_KEY in a `.env` file instead.",
-            autocomplete="off",
-        )
-        st.checkbox(
-            "Remember this key on this device",
-            key="remember_aeroapi_key",
-            help="Saves the key in a first-party browser cookie (about 90 days) for this site only. "
-            "Do not use on shared or public computers. Untick to remove the cookie.",
-        )
-        cookie_prefs.sync_remembered_api_key()
         st.caption(
-            "Live data is **cached ~20s**. Use **Refresh live data** for an immediate pull."
+            "Live ADS-B via **OpenSky Network** (+ **ADSBDB** route hints). "
+            "Cached about **20s**; use **Refresh live data** to force a new pull."
         )
         st.text_input(
             "Flight number",
             key="inp_flight",
-            help="FlightAware / AeroAPI ident (e.g. VS4, BA220). If you type anything here, "
-            "the main card uses **Flight tracker** mode and **ignores** the roster. "
+            help="Callsign or flight id (e.g. VS4, VIR4, UAL182). If you type anything here, "
+            "the main card uses **tracker** mode and **ignores** the roster. "
             "Clear the box to follow the next imported roster leg again.",
         )
         roster_db.init_db()
         st.date_input(
-            "Search / history date (UK)",
+            "Segment / history date (UK calendar)",
             format="DD/MM/YYYY",
             key="inp_fa_date",
-            help="**FlightAware:** schedule day for AeroAPI. **OpenSky:** narrows recent ADS-B segment labels (UTC day). "
-            "Leave empty for **today** when using FlightAware date logic; OpenSky positions are always live.",
+            help="Narrows which recent OpenSky ADS-B segment is labeled (UTC day overlap). "
+            "Positions are always live; leave empty for **today**.",
         )
         _fd = st.session_state.get("inp_fa_date")
         if isinstance(_fd, datetime):
             _fd = _fd.date()
         if isinstance(_fd, date):
-            st.caption(f"FlightAware search day: **{roster_db.format_uk_date(_fd)}**.")
+            st.caption(f"OpenSky segment day: **{roster_db.format_uk_date(_fd)}**.")
 
         if roster_db.roster_row_count():
             st.caption("Non-empty **Flight number** = tracker overrides roster. Leave blank to use the roster.")
         if st.button(
             "Refresh live data",
-            help="Clears the in-memory FlightAware and OpenSky caches and refetches.",
+            help="Clears the in-memory OpenSky cache and refetches.",
             use_container_width=True,
             key="fa_force_refresh",
         ):
-            _cached_fa_bundle.clear()
             _cached_opensky_bundle.clear()
             st.toast("Live data cache cleared — fetching fresh data.", icon="🔄")
             st.rerun()
-        _render_flightaware_sidebar_button()
 
         st.markdown("---")
         st.markdown("### My Roster")
@@ -763,7 +601,7 @@ def render_sidebar() -> None:
             st.markdown(
                 """
 **Personal Crew Schedule Report (Virgin-style export)**  
-Whole-file import is supported: flying duties with **Details** like `LHR  - BOS` and **Report times** become roster legs. If the row has **VS** / **VIR** in the text, that flight number is used. Otherwise a numeric **Duties** code (e.g. `157`) is mapped to **VS157**. If neither applies, the leg is stored as `LHR-BOS-YYYYMMDD` — **Add your VS flight number in the sidebar for live FlightAware data.**
+Whole-file import is supported: flying duties with **Details** like `LHR  - BOS` and **Report times** become roster legs. If the row has **VS** / **VIR** in the text, that flight number is used. Otherwise a numeric **Duties** code (e.g. `157`) is mapped to **VS157**. If neither applies, the leg is stored as `LHR-BOS-YYYYMMDD` — **add your VS flight number in the sidebar** for reliable callsign lookup.
 
 **Required (any one alias each)**  
 - **Flight:** `flight_number`, `flight`, `flight_no`, `flt`, `ident`  
@@ -774,42 +612,11 @@ Whole-file import is supported: flying duties with **Details** like `LHR  - BOS`
 - **Arrival:** `arr_time`, `arrival_time`, `STA`, `ETA`, plus optional `arr_date`  
 - **Route:** `origin` / `from` / `dep_airport`, `destination` / `to` / `arr_airport`  
 - **Block:** `block_minutes` (used if arrival time is missing; default **90** minutes)  
-- **`callsign`** / **`icao24`**: optional hints for lookups elsewhere  
+- **`callsign`** / **`icao24`**: optional hints for OpenSky lookup  
 
-**Main dashboard** uses **FlightAware AeroAPI** — add **Your FlightAware AeroAPI key** in the sidebar (or `AEROAPI_KEY` in `.env` when you run locally).
+**Main dashboard** uses **OpenSky** (no airline API key).
 """
             )
-
-
-def _render_flightaware_sidebar_button() -> None:
-    sb = str(st.session_state.get("inp_flight", "")).strip()
-    if sb:
-        ident = flightaware_links.preferred_flightaware_ident(sb, None, None)
-        label = "Open tracker flight on FlightAware (UK)"
-        url = flightaware_links.live_flight_url(ident)
-        st.link_button(label, url, use_container_width=True)
-        st.caption("Opens uk.flightaware.com in your browser (full site).")
-        return
-
-    n = roster_db.roster_row_count()
-    if n:
-        leg = roster_db.next_roster_leg()
-        if leg is None:
-            st.caption("FlightAware web: no upcoming roster leg.")
-            return
-        fa_fn, _ = roster_db.flightaware_ident_from_leg(leg, "")
-        ident = flightaware_links.preferred_flightaware_ident(
-            fa_fn,
-            (leg.callsign or "").strip() or None,
-            None,
-        )
-        label = "Open roster flight on FlightAware (UK)"
-    else:
-        st.caption("Enter a flight number for the web link.")
-        return
-    url = flightaware_links.live_flight_url(ident)
-    st.link_button(label, url, use_container_width=True)
-    st.caption("Opens uk.flightaware.com in your browser (full site).")
 
 
 def _leg_route_arrow(leg: roster_db.RosterLeg | None) -> str:
@@ -825,7 +632,7 @@ def _virgin_787_layout_eligible(
     leg: roster_db.RosterLeg | None,
     sb: str,
 ) -> bool:
-    """Bundled 787 art: VS ident, FlightAware row, or Virgin crew roster leg."""
+    """Bundled 787 art: VS ident, tracker row, or Virgin crew roster leg."""
     if not VIRGIN_787_IMAGE.is_file():
         return False
     if flight_identity.is_virgin_atlantic(user_raw, row):
@@ -903,12 +710,12 @@ def _render_identity_line(user_input: str | None, row: dict[str, Any] | None) ->
 
 def _render_live_flight_board(board: dict[str, Any], *, embedded: bool = False) -> None:
     b = board
-    tag = str(b.get("data_source_tag") or "FlightAware")
+    tag = str(b.get("data_source_tag") or "OpenSky")
     if embedded:
         st.markdown(f"#### Live ({escape(tag)})")
     else:
         st.markdown(f"##### Live flight ({escape(tag)})")
-    trio = aeroapi_client.live_position_lines(b.get("position_lat"), b.get("position_lon"))
+    trio = geo_places.live_position_lines(b.get("position_lat"), b.get("position_lon"))
     if trio is None:
         st.markdown(
             '<p class="live-currently-over"><span class="live-currently-over__label">Position</span>'
@@ -967,7 +774,7 @@ def _render_live_flight_board(board: dict[str, Any], *, embedded: bool = False) 
         st.caption(f'Arr {escape(str(b.get("gate_destination") or "—"))}')
 
 
-@st.fragment(run_every=timedelta(seconds=_FA_CACHE_TTL))
+@st.fragment(run_every=timedelta(seconds=_LIVE_CACHE_TTL))
 def live_next_flight_fragment() -> None:
     roster_db.init_db()
     n_roster = roster_db.roster_row_count()
@@ -975,9 +782,10 @@ def live_next_flight_fragment() -> None:
     bundle = _bundle_for_dashboard(n_roster=n_roster, leg=leg)
 
     err = bundle.get("err")
-    row = bundle.get("flight")
+    row = bundle.get("flight") if isinstance(bundle.get("flight"), dict) else None
     board = bundle.get("board") or {}
-    pos = bundle.get("position")
+    pos_os = bundle.get("opensky_pos")
+    route_adb = bundle.get("opensky_route_adb")
 
     sb = str(st.session_state.inp_flight).strip()
     if sb:
@@ -986,113 +794,31 @@ def live_next_flight_fragment() -> None:
         user_raw = leg.flight_number.strip()
     else:
         user_raw = ""
-    _render_identity_line(user_raw, row if isinstance(row, dict) else None)
+    _render_identity_line(user_raw, row)
 
-    bundle_source = str(bundle.get("source", "flightaware"))
+    route_txt = _leg_route_arrow(leg)
     flight_subline = ""
+    flight_no = "—"
+    dep_route = arr_route = dep_when = arr_when = "—"
+    pct, status_line = 0.0, "—"
+    eyebrow = "OpenSky"
+    journey_html = _journey_block_html(opensky_live.empty_journey_metrics())
 
-    if bundle_source == "opensky":
-        err = bundle.get("err")
-        row = bundle.get("flight") if isinstance(bundle.get("flight"), dict) else None
-        board = bundle.get("board") or {}
-        pos_os = bundle.get("opensky_pos")
-        route_adb = bundle.get("opensky_route_adb")
-        route_txt = _leg_route_arrow(leg)
-
-        flight_no = "—"
-        flight_subline = ""
-        dep_route = arr_route = dep_when = arr_when = "—"
-        pct, status_line = 0.0, "—"
-        eyebrow = "OpenSky"
-        journey_html = _journey_block_html(opensky_live.empty_journey_metrics())
-
-        if err == "no_upcoming_leg":
-            dep_route = arr_route = dep_when = arr_when = "—"
-            pct, status_line = 0.0, "No upcoming flights in roster"
-            flight_no = "—"
-            eyebrow = "Next flight (roster)"
-        elif err:
-            flight_subline = ""
-            dep_route = arr_route = dep_when = arr_when = "—"
-            pct, status_line = 0.0, f"OpenSky: {err}"
-            eyebrow = "Next flight (roster)" if (leg and not sb) else "Flight tracker"
-            journey_html = _journey_block_html(opensky_live.empty_journey_metrics())
-            if leg and not sb:
-                fn_stored = leg.flight_number.strip()
-                o_u, d_u = leg.origin.strip().upper(), leg.destination.strip().upper()
-                dep_route = escape(f"{o_u} → {d_u}" if (o_u or d_u) else "—")
-                dep_when = escape(roster_db.format_uk_datetime(leg.dep))
-                arr_route = escape(d_u if d_u else (o_u or "—"))
-                arr_when = escape(roster_db.format_uk_datetime(leg.arr))
-                if roster_db.is_route_only_flight_number(fn_stored):
-                    flight_no = escape(roster_db.imported_table_flight_label(leg))
-                    flight_subline = "Virgin Atlantic"
-                    if route_txt:
-                        flight_subline += f" · {route_txt}"
-                    flight_subline += " · Try **VIR…** callsign if VS search fails"
-                else:
-                    flight_no = escape(fn_stored)
-                    flight_subline = "Virgin Atlantic"
-                    if route_txt:
-                        flight_subline += f" · {route_txt}"
-            else:
-                flight_no = escape(user_raw or "-")
-        elif board and pos_os is not None:
-            dep_route = escape(str(bundle.get("opensky_dep_route") or "—"))
-            arr_route = escape(str(bundle.get("opensky_arr_route") or "—"))
-            dep_when = escape(str(bundle.get("opensky_dep_when") or "—"))
-            arr_when = escape(str(bundle.get("opensky_arr_when") or "—"))
-            pct = float(bundle.get("opensky_fraction") or 0.0)
-            status_line = str(bundle.get("opensky_status") or "—")
-            if isinstance(status_line, str) and len(status_line) > 120:
-                status_line = status_line[:117] + "…"
-            journey_html = _journey_block_html(
-                opensky_live.journey_metrics_strings(pos_os, route_adb, pct)
-            )
-            ident_txt = (str(row.get("ident") or "").strip() if row else "") or user_raw
-            if n_roster and leg and not sb:
-                if not roster_db.is_route_only_flight_number(leg.flight_number.strip()):
-                    flight_no = escape(leg.flight_number.strip())
-                else:
-                    flight_no = escape(roster_db.imported_table_flight_label(leg))
-                flight_subline = "Virgin Atlantic"
-                if route_txt:
-                    flight_subline += f" · {route_txt}"
-                eyebrow = "Next leg (OpenSky)"
-            else:
-                flight_no = escape(ident_txt or "—")
-                eyebrow = "Live tracker (OpenSky)"
-            if sb and leg and route_txt:
-                pre = f"Roster sector · {route_txt}"
-                flight_subline = f"{pre} · {flight_subline}" if flight_subline else pre
-        else:
-            flight_no = escape(user_raw or "—")
-            pct, status_line = 0.0, "OpenSky: no live board rows"
-    elif not _effective_aeroapi_key():
-        flight_no = "—"
-        dep_route = arr_route = dep_when = arr_when = "—"
-        pct, status_line = 0.0, "Add your FlightAware AeroAPI key in the sidebar (or set AEROAPI_KEY locally)"
-        eyebrow = "FlightAware"
-        journey_html = _journey_block_html(aeroapi_client.journey_metrics_strings(None, None, {}))
-    elif n_roster and leg is None and not sb:
+    if err == "no_upcoming_leg":
         dep_route = arr_route = dep_when = arr_when = "—"
         pct, status_line = 0.0, "No upcoming flights in roster"
         flight_no = "—"
         eyebrow = "Next flight (roster)"
-        journey_html = _journey_block_html(aeroapi_client.journey_metrics_strings(None, None, {}))
     elif err:
         flight_subline = ""
         dep_route = arr_route = dep_when = arr_when = "—"
-        pct, status_line = 0.0, f"FlightAware: {err}"
+        pct, status_line = 0.0, f"OpenSky: {err}"
         eyebrow = "Next flight (roster)" if (leg and not sb) else "Flight tracker"
-        journey_html = _journey_block_html(aeroapi_client.journey_metrics_strings(None, None, {}))
+        journey_html = _journey_block_html(opensky_live.empty_journey_metrics())
         if leg and not sb:
             fn_stored = leg.flight_number.strip()
-            route_txt = _leg_route_arrow(leg)
             o_u, d_u = leg.origin.strip().upper(), leg.destination.strip().upper()
-            dep_route = escape(
-                f"{o_u} → {d_u}" if (o_u or d_u) else "—",
-            )
+            dep_route = escape(f"{o_u} → {d_u}" if (o_u or d_u) else "—")
             dep_when = escape(roster_db.format_uk_datetime(leg.dep))
             arr_route = escape(d_u if d_u else (o_u or "—"))
             arr_when = escape(roster_db.format_uk_datetime(leg.arr))
@@ -1101,7 +827,7 @@ def live_next_flight_fragment() -> None:
                 flight_subline = "Virgin Atlantic"
                 if route_txt:
                     flight_subline += f" · {route_txt}"
-                flight_subline += " · Add your VS flight number in the sidebar for live FlightAware data"
+                flight_subline += " · Try **VIR…** callsign if VS search fails"
             else:
                 flight_no = escape(fn_stored)
                 flight_subline = "Virgin Atlantic"
@@ -1109,60 +835,37 @@ def live_next_flight_fragment() -> None:
                     flight_subline += f" · {route_txt}"
         else:
             flight_no = escape(user_raw or "-")
-    elif row:
-        origin = row.get("origin") if isinstance(row.get("origin"), dict) else None
-        dest = row.get("destination") if isinstance(row.get("destination"), dict) else None
-        dep_route = aeroapi_client.airport_route_line(origin)
-        arr_route = aeroapi_client.airport_route_line(dest)
-        dep_when = aeroapi_client.format_iso_at_airport_datetime_only(
-            aeroapi_client.pick_departure_iso_for_display(row, pos if isinstance(pos, dict) else None),
-            origin,
+    elif board and pos_os is not None:
+        dep_route = escape(str(bundle.get("opensky_dep_route") or "—"))
+        arr_route = escape(str(bundle.get("opensky_arr_route") or "—"))
+        dep_when = escape(str(bundle.get("opensky_dep_when") or "—"))
+        arr_when = escape(str(bundle.get("opensky_arr_when") or "—"))
+        pct = float(bundle.get("opensky_fraction") or 0.0)
+        status_line = str(bundle.get("opensky_status") or "—")
+        if isinstance(status_line, str) and len(status_line) > 120:
+            status_line = status_line[:117] + "…"
+        journey_html = _journey_block_html(
+            opensky_live.journey_metrics_strings(pos_os, route_adb, pct)
         )
-        arr_when = aeroapi_client.format_iso_at_airport_datetime_only(
-            aeroapi_client.pick_arrival_iso_for_display(row, pos if isinstance(pos, dict) else None),
-            dest,
-        )
-        pct, status_line = _progress_from_fa(row, board)
-        fn = (row.get("ident_iata") or row.get("ident_icao") or row.get("ident") or "").strip()
-        route_txt = _leg_route_arrow(leg)
-        flight_subline = ""
+        ident_txt = (str(row.get("ident") or "").strip() if row else "") or user_raw
         if n_roster and leg and not sb:
-            ident = (row.get("ident_iata") or row.get("ident_icao") or row.get("ident") or "").strip()
-            if ident:
-                flight_no = escape(ident)
-            elif not roster_db.is_route_only_flight_number(leg.flight_number):
+            if not roster_db.is_route_only_flight_number(leg.flight_number.strip()):
                 flight_no = escape(leg.flight_number.strip())
             else:
                 flight_no = escape(roster_db.imported_table_flight_label(leg))
             flight_subline = "Virgin Atlantic"
             if route_txt:
                 flight_subline += f" · {route_txt}"
-            if roster_db.is_route_only_flight_number(leg.flight_number) and not ident:
-                flight_subline += " · Add your VS flight number in the sidebar for live FlightAware data"
-            eyebrow = "Next flight (FlightAware)"
+            eyebrow = "Next leg (OpenSky)"
         else:
-            flight_no = escape(sb or fn or "—")
-            eyebrow = "Flight tracker (FlightAware)"
-            if sb and leg and route_txt:
-                flight_subline = f"Roster sector · {route_txt}"
-            elif flight_identity.is_virgin_atlantic(sb or user_raw, row):
-                flight_subline = "Virgin Atlantic"
-        if isinstance(status_line, str) and len(status_line) > 120:
-            status_line = status_line[:117] + "…"
-        journey_html = _journey_block_html(
-            aeroapi_client.journey_metrics_strings(
-                row,
-                pos if isinstance(pos, dict) else None,
-                board,
-            )
-        )
+            flight_no = escape(ident_txt or "—")
+            eyebrow = "Live tracker (OpenSky)"
+        if sb and leg and route_txt:
+            pre = f"Roster sector · {route_txt}"
+            flight_subline = f"{pre} · {flight_subline}" if flight_subline else pre
     else:
-        flight_no = "—"
-        flight_subline = ""
-        dep_route = arr_route = dep_when = arr_when = "—"
-        pct, status_line = 0.0, "—"
-        eyebrow = "FlightAware"
-        journey_html = _journey_block_html(aeroapi_client.journey_metrics_strings(None, None, {}))
+        flight_no = escape(user_raw or "—")
+        pct, status_line = 0.0, "OpenSky: no live board rows"
 
     card_body = _flight_card_html(
         eyebrow=eyebrow,
@@ -1202,29 +905,21 @@ def live_next_flight_fragment() -> None:
 
 
 def _route_line_from_bundle(bundle: dict[str, Any], n: int, leg: roster_db.RosterLeg | None) -> str:
-    row = bundle.get("flight")
     sb = str(st.session_state.inp_flight).strip()
-    if bundle.get("source") == "opensky" and bundle.get("board"):
-        b = bundle["board"]
-        o = escape((b.get("origin_text") or "—").split(" · ")[0][:12])
-        d = escape((b.get("destination_text") or "—").split(" · ")[0][:12])
-        return f"{o} → {d}"
-    if row and bundle.get("board"):
+    if bundle.get("board"):
         b = bundle["board"]
         o = escape((b.get("origin_text") or "—").split(" · ")[0][:12])
         d = escape((b.get("destination_text") or "—").split(" · ")[0][:12])
         return f"{o} → {d}"
     if sb:
-        suffix = "OpenSky…" if str(st.session_state.get("inp_live_source")) == "opensky" else "FlightAware…"
-        return escape(sb) + f" — {suffix}"
+        return escape(sb) + " — OpenSky…"
     if n and leg:
         o, d = escape(leg.origin.strip().upper()), escape(leg.destination.strip().upper())
         return f"{o} → {d}" if (o or d) else "Roster leg"
     if n:
         return "Roster loaded — no upcoming departure"
     fn = str(st.session_state.inp_flight).strip()
-    sfx = "OpenSky…" if str(st.session_state.get("inp_live_source")) == "opensky" else "FlightAware…"
-    return escape(fn) + f" — {sfx}" if fn else "Flight tracker"
+    return escape(fn) + " — OpenSky…" if fn else "Flight tracker"
 
 
 def main() -> None:
@@ -1246,7 +941,7 @@ def main() -> None:
     bundle = _bundle_for_dashboard(n_roster=n, leg=leg)
     if st.button(
         "Flight tracker & roster",
-        help="Opens the left sidebar: flight number, FlightAware search date, roster CSV, and refresh.",
+        help="Opens the left sidebar: flight number, segment date, roster CSV, and refresh.",
         type="secondary",
         key="main_open_sidebar",
     ):
@@ -1260,12 +955,12 @@ def main() -> None:
             st.caption(
                 f"**Roster mode:** next sector **{route_s}**, dep **{roster_db.format_uk_datetime(leg.dep)}** "
                 f"(imported duty **{leg.callsign or '—'}**). "
-                "Use **FlightAware search date** in the sidebar to query another day."
+                "Use **Segment / history date** in the sidebar to pick another UTC day for OpenSky labels."
             )
         else:
             st.caption(
                 f"**Roster mode:** next leg **{leg.flight_number.strip()}**, dep **{roster_db.format_uk_datetime(leg.dep)}** "
-                f"({route_s}). Change **FlightAware search date** below the flight box to search a different day."
+                f"({route_s}). Change **Segment / history date** below the flight box to adjust OpenSky segment matching."
             )
 
     live_next_flight_fragment()
