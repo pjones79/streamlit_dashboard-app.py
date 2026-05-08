@@ -211,30 +211,51 @@ def _cs_matches(opensky_cs: str | None, candidates: list[str]) -> bool:
 
 
 def fetch_states(ttl_seconds: float = 25.0) -> list | None:
-    """Return OpenSky state vectors (raw arrays); cached to reduce rate limit pressure."""
+    """Return OpenSky state vectors (raw arrays); cached to reduce rate limit pressure.
+
+    Returns ``None`` only when every fetch attempt fails and there is no prior cache
+    (distinct from ``[]``, which means "feed responded but no state rows").
+    """
     global _cache_states, _cache_at
     now = time.monotonic()
     if _cache_states is not None and (now - _cache_at) < ttl_seconds:
         return _cache_states
 
-    _ua = {
+    headers = {
         "User-Agent": "TheFlightWall-OSS/1.0 (opensky live; +https://github.com/)",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
     }
-    try:
-        r = requests.get(OPENSKY_STATES_URL, timeout=35, headers=_ua)
-        r.raise_for_status()
-        payload = r.json()
-    except (requests.RequestException, ValueError):
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                OPENSKY_STATES_URL,
+                timeout=(12, 90),
+                headers=headers,
+                trust_env=False,
+            )
+            if r.status_code == 429:
+                time.sleep(min(8.0, 1.5 * (2**attempt)))
+                continue
+            if r.status_code >= 500:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            payload = r.json()
+        except (requests.RequestException, ValueError):
+            time.sleep(0.35 * (attempt + 1))
+            continue
+
+        states = payload.get("states") if isinstance(payload, dict) else None
+        if not states:
+            _cache_states = _cache_states or []
+            _cache_at = time.monotonic()
+            return _cache_states
+
+        _cache_states = states
+        _cache_at = time.monotonic()
         return _cache_states
 
-    states = payload.get("states") if isinstance(payload, dict) else None
-    if not states:
-        _cache_states = _cache_states or []
-        _cache_at = now
-        return _cache_states
-
-    _cache_states = states
-    _cache_at = now
     return _cache_states
 
 
@@ -252,10 +273,12 @@ def fetch_aircraft_flights(icao24: str, begin: int, end: int) -> list[dict[str, 
         r = requests.get(
             OPENSKY_FLIGHTS_AIRCRAFT,
             params={"icao24": h, "begin": int(begin), "end": int(end)},
-            timeout=35,
+            timeout=(12, 60),
             headers={
                 "User-Agent": "TheFlightWall-OSS/1.0 (opensky live; +https://github.com/)",
+                "Accept": "application/json",
             },
+            trust_env=False,
         )
         if r.status_code != 200:
             return []

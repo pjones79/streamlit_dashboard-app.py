@@ -363,7 +363,7 @@ def _init_session_defaults() -> None:
 
 
 # Bump when dashboard behavior or defaults change so cache + session quirks reset once per user session.
-_DASHBOARD_BUILD = 13
+_DASHBOARD_BUILD = 14
 
 
 def _compact_flight(s: str) -> str:
@@ -531,8 +531,9 @@ def _opensky_err_user_message(code: str | None) -> str:
         )
     if c == "opensky_feed_unavailable":
         return (
-            "Could not load the OpenSky aircraft feed from this app session (network, timeout, or rate limit). "
-            "Try **Refresh live data** in the sidebar after a short wait."
+            "Could not load the OpenSky aircraft feed (network, timeout, or rate limit). "
+            "**Streamlit Cloud** and other shared hosts sometimes hit OpenSky limits — try **Refresh live data**, "
+            "or run the app locally. Also try **Refresh** again after a minute."
         )
     if c == "not_in_airspace":
         return (
@@ -863,6 +864,21 @@ def live_next_flight_fragment() -> None:
         user_raw = leg.flight_number.strip()
     else:
         user_raw = ""
+    icao_q = _manual_icao24_sidebar()
+    has_tracker_intent = bool(sb) or bool(icao_q) or (n_roster and leg is not None)
+
+    if err in ("no_flight", "opensky_feed_unavailable") and not has_tracker_intent:
+        if err == "opensky_feed_unavailable":
+            st.warning(_opensky_err_user_message(err))
+        else:
+            st.caption("Use the **sidebar** to enter a flight or **ICAO24**, or import a **roster CSV**.")
+        return
+
+    if err == "opensky_feed_unavailable":
+        _render_identity_line(user_raw, row)
+        st.error(_opensky_err_user_message(err))
+        return
+
     _render_identity_line(user_raw, row)
 
     route_txt = _leg_route_arrow(leg)
@@ -994,7 +1010,7 @@ def _route_line_from_bundle(bundle: dict[str, Any], n: int, leg: roster_db.Roste
     if n:
         return "Roster loaded — no upcoming departure"
     fn = str(st.session_state.inp_flight).strip()
-    return escape(fn) + " — OpenSky…" if fn else "Flight tracker"
+    return escape(fn) + " — OpenSky…" if fn else "Departures"
 
 
 def main() -> None:
