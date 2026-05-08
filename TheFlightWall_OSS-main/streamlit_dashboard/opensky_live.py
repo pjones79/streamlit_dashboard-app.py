@@ -14,6 +14,9 @@ from urllib.parse import quote
 
 OPENSKY_STATES_URL = "https://opensky-network.org/api/states/all"
 OPENSKY_FLIGHTS_AIRCRAFT = "https://opensky-network.org/api/flights/aircraft"
+OPENSKY_OAUTH_TOKEN_URL = (
+    "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+)
 ADSBDB_CALLSIGN_URL = "https://api.adsbdb.com/v0/callsign/"
 
 # Smaller geographic pulls first — ``/states/all`` (worldwide) is huge and often times out on PaaS.
@@ -87,6 +90,9 @@ _cache_states: list | None = None
 _cache_at: float = 0.0
 _lookup_pos_cache: dict[str, tuple[float, AircraftPosition | None]] = {}
 _opensky_http_client: requests.Session | None = None
+_opensky_access_token: str | None = None
+_opensky_access_deadline: float = 0.0
+_OPENSKY_TOKEN_MARGIN_S = 45.0
 
 
 def _opensky_http() -> requests.Session:
@@ -232,31 +238,104 @@ def _cs_matches(opensky_cs: str | None, candidates: list[str]) -> bool:
     return False
 
 
-def _opensky_auth() -> tuple[str, str] | None:
-    """Optional OpenSky account — env vars or Streamlit Cloud ``secrets.toml``."""
-    u = os.getenv("OPENSKY_USERNAME", "").strip()
-    p = os.getenv("OPENSKY_PASSWORD", "").strip()
-    if not u or not p:
+def _opensky_invalidate_token() -> None:
+    global _opensky_access_token, _opensky_access_deadline
+    _opensky_access_token = None
+    _opensky_access_deadline = 0.0
+
+
+def _opensky_client_credentials() -> tuple[str, str] | None:
+    """OAuth2 API client id + secret from env or Streamlit secrets (not your website password)."""
+    cid = os.getenv("OPENSKY_CLIENT_ID", "").strip()
+    csec = os.getenv("OPENSKY_CLIENT_SECRET", "").strip()
+    if not cid or not csec:
         try:
             import streamlit as st
 
             sec = getattr(st, "secrets", None)
-            if sec is not None and "OPENSKY_USERNAME" in sec and "OPENSKY_PASSWORD" in sec:
-                u = u or str(sec["OPENSKY_USERNAME"]).strip()
-                p = p or str(sec["OPENSKY_PASSWORD"]).strip()
+            if sec is not None and "OPENSKY_CLIENT_ID" in sec and "OPENSKY_CLIENT_SECRET" in sec:
+                cid = cid or str(sec["OPENSKY_CLIENT_ID"]).strip()
+                csec = csec or str(sec["OPENSKY_CLIENT_SECRET"]).strip()
         except Exception:
             pass
-    if u and p:
-        return (u, p)
+    if cid and csec:
+        return (cid, csec)
     return None
+
+
+def _opensky_bearer_token() -> str | None:
+    """Client-credentials access token; OpenSky API requires ``Authorization: Bearer`` (Basic auth retired)."""
+    global _opensky_access_token, _opensky_access_deadline
+    creds = _opensky_client_credentials()
+    if not creds:
+        return None
+    now = time.monotonic()
+    if _opensky_access_token and now < _opensky_access_deadline:
+        return _opensky_access_token
+    cid, csec = creds
+    try:
+        r = _opensky_http().post(
+            OPENSKY_OAUTH_TOKEN_URL,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": cid,
+                "client_secret": csec,
+            },
+            timeout=(10, 35),
+            headers={"Accept": "application/json"},
+        )
+        r.raise_for_status()
+        payload = r.json()
+        token = str(payload.get("access_token", "")).strip()
+        if not token:
+            _opensky_invalidate_token()
+            return None
+        exp = int(payload.get("expires_in", 1700))
+        _opensky_access_token = token
+        _opensky_access_deadline = now + max(30.0, float(exp) - _OPENSKY_TOKEN_MARGIN_S)
+        return token
+    except (requests.RequestException, ValueError, TypeError):
+        _opensky_invalidate_token()
+        return None
+
+
+def _opensky_api_headers() -> dict[str, str]:
+    h: dict[str, str] = {
+        "User-Agent": "TheFlightWall-OSS/1.0 (opensky live; +https://github.com/)",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    tok = _opensky_bearer_token()
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
+def _opensky_api_get(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    timeout: tuple[float, float],
+) -> requests.Response:
+    """GET an OpenSky ``/api/...`` URL; on 401, drop cached token and retry once."""
+    last: requests.Response | None = None
+    for redo in range(2):
+        last = _opensky_http().get(url, params=params, headers=_opensky_api_headers(), timeout=timeout)
+        if last.status_code == 401 and _opensky_client_credentials() and redo == 0:
+            _opensky_invalidate_token()
+            continue
+        return last
+    return last  # type: ignore[return-value]
 
 
 def fetch_states(ttl_seconds: float = 25.0) -> list | None:
     """Return OpenSky state vectors (raw arrays); cached to reduce rate limit pressure.
 
     Uses several **bounding-box** requests first (smaller than worldwide ``/states/all``),
-    which usually succeeds on slow hosts (e.g. Streamlit Cloud). Optional
-    ``OPENSKY_USERNAME`` / ``OPENSKY_PASSWORD`` improve rate limits.
+    which usually succeeds on slow hosts (e.g. Streamlit Cloud).
+
+    Optional ``OPENSKY_CLIENT_ID`` + ``OPENSKY_CLIENT_SECRET`` (OAuth client credentials from
+    your OpenSky account) add a Bearer token and better rate limits. Anonymous calls omit auth.
 
     Returns ``None`` only when every fetch attempt fails and there is no prior cache
     (distinct from ``[]``, which means "feed responded but no state rows").
@@ -265,13 +344,6 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
     now = time.monotonic()
     if _cache_states is not None and (now - _cache_at) < ttl_seconds:
         return _cache_states
-
-    headers = {
-        "User-Agent": "TheFlightWall-OSS/1.0 (opensky live; +https://github.com/)",
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip, deflate",
-    }
-    auth = _opensky_auth()
 
     merged: dict[str, list[Any]] = {}
 
@@ -290,7 +362,7 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
 
     for lamin, lamax, lomin, lomax in _OPENSKY_BBOX_ATTEMPTS:
         try:
-            r = _opensky_http().get(
+            r = _opensky_api_get(
                 OPENSKY_STATES_URL,
                 params={
                     "lamin": lamin,
@@ -299,8 +371,6 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
                     "lomax": lomax,
                 },
                 timeout=(10, 55),
-                headers=headers,
-                auth=auth,
             )
             if r.status_code == 429:
                 time.sleep(2.0)
@@ -321,11 +391,10 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
     # Worldwide fallback — large JSON; may time out on shared infrastructure.
     for attempt in range(2):
         try:
-            r = _opensky_http().get(
+            r = _opensky_api_get(
                 OPENSKY_STATES_URL,
+                params=None,
                 timeout=(15, 120),
-                headers=headers,
-                auth=auth,
             )
             if r.status_code == 429:
                 time.sleep(min(8.0, 1.5 * (2**attempt)))
@@ -363,15 +432,10 @@ def fetch_aircraft_flights(icao24: str, begin: int, end: int) -> list[dict[str, 
     if not h or end <= begin:
         return []
     try:
-        r = _opensky_http().get(
+        r = _opensky_api_get(
             OPENSKY_FLIGHTS_AIRCRAFT,
             params={"icao24": h, "begin": int(begin), "end": int(end)},
             timeout=(12, 60),
-            headers={
-                "User-Agent": "TheFlightWall-OSS/1.0 (opensky live; +https://github.com/)",
-                "Accept": "application/json",
-            },
-            auth=_opensky_auth(),
         )
         if r.status_code != 200:
             return []

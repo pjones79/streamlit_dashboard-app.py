@@ -363,7 +363,7 @@ def _init_session_defaults() -> None:
 
 
 # Bump when dashboard behavior or defaults change so cache + session quirks reset once per user session.
-_DASHBOARD_BUILD = 15
+_DASHBOARD_BUILD = 16
 
 
 def _compact_flight(s: str) -> str:
@@ -533,7 +533,8 @@ def _opensky_err_user_message(code: str | None) -> str:
         return (
             "Could not load OpenSky traffic data from this host (timeout, block, or rate limit). "
             "The app already tries **smaller regional** downloads first for Cloud. "
-            "Add a free **OpenSky** login via secrets ``OPENSKY_USERNAME`` / ``OPENSKY_PASSWORD`` (see repo `.env.example`), "
+            "Add **OpenSky** API credentials via secrets ``OPENSKY_CLIENT_ID`` + ``OPENSKY_CLIENT_SECRET`` "
+            "(OAuth client from opensky-network.org; see `.env.example`), "
             "then **Refresh live data**. Or run the dashboard locally."
         )
     if c == "not_in_airspace":
