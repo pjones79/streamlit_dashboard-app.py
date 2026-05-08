@@ -75,17 +75,17 @@ class FlightRoute:
 _cache_states: list | None = None
 _cache_at: float = 0.0
 _lookup_pos_cache: dict[str, tuple[float, AircraftPosition | None]] = {}
-_opensky_session: requests.Session | None = None
+_opensky_http_client: requests.Session | None = None
 
 
-def _opensky_session() -> requests.Session:
-    """Shared session with ``trust_env=False`` (PaaS proxies). Avoids ``trust_env`` on ``get()`` (needs newer requests)."""
-    global _opensky_session
-    if _opensky_session is None:
+def _opensky_http() -> requests.Session:
+    """Shared Session; ``trust_env=False`` avoids broken HTTP(S)_PROXY on PaaS hosts."""
+    global _opensky_http_client
+    if _opensky_http_client is None:
         s = requests.Session()
         s.trust_env = False
-        _opensky_session = s
-    return _opensky_session
+        _opensky_http_client = s
+    return _opensky_http_client
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -239,7 +239,7 @@ def fetch_states(ttl_seconds: float = 25.0) -> list | None:
     }
     for attempt in range(3):
         try:
-            r = _opensky_session().get(
+            r = _opensky_http().get(
                 OPENSKY_STATES_URL,
                 timeout=(12, 90),
                 headers=headers,
@@ -280,7 +280,7 @@ def fetch_aircraft_flights(icao24: str, begin: int, end: int) -> list[dict[str, 
     if not h or end <= begin:
         return []
     try:
-        r = _opensky_session().get(
+        r = _opensky_http().get(
             OPENSKY_FLIGHTS_AIRCRAFT,
             params={"icao24": h, "begin": int(begin), "end": int(end)},
             timeout=(12, 60),
